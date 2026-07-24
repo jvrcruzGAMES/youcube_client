@@ -813,22 +813,27 @@ local function play_vid(buffer, force_fps, string_unpack, display)
         if is_directgpu then
             local gpu = display.gpu
             local display_id = display.display_id
-            local scale_x = math.max(1, math.floor(display.width / (width * 2)))
-            local scale_y = math.max(1, math.floor(display.height / (height * 3)))
-            local offset_x = math.floor((display.width - (width * 2 * scale_x)) / 2)
-            local offset_y = math.floor((display.height - (height * 3 * scale_y)) / 2)
+            local ratio_x = display.width / (width * 2)
+            local ratio_y = display.height / (height * 3)
 
             for y = 1, height do
                 local line_chars = text[y]
+                local ry1 = (y - 1) * 3
+                local ty0 = math.floor(ry1 * ratio_y)
+                local ty1 = math.floor((ry1 + 1) * ratio_y)
+                local ty2 = math.floor((ry1 + 2) * ratio_y)
+                local ty3 = math.floor((ry1 + 3) * ratio_y)
+
                 for x = 1, width do
                     local char_code = line_chars:byte(x) or 32
                     local subpixels = decode_teletext(char_code)
                     local fg_color = frame_palette[bit32.band(c, 0x0F)]
                     local bg_color = frame_palette[bit32.rshift(c, 4)]
 
-                    -- Calculate the base coordinates for the character cell on the screen
-                    local base_x = offset_x + (x - 1) * 2 * scale_x
-                    local base_y = offset_y + (y - 1) * 3 * scale_y
+                    local rx1 = (x - 1) * 2
+                    local tx0 = math.floor(rx1 * ratio_x)
+                    local tx1 = math.floor((rx1 + 1) * ratio_x)
+                    local tx2 = math.floor((rx1 + 2) * ratio_x)
 
                     -- Draw each of the 6 subpixel blocks
                     local c1 = subpixels[1] == 1 and fg_color or bg_color
@@ -838,16 +843,40 @@ local function play_vid(buffer, force_fps, string_unpack, display)
                     local c5 = subpixels[5] == 1 and fg_color or bg_color
                     local c6 = subpixels[6] == 1 and fg_color or bg_color
 
-                    for dy = 1, scale_y do
-                        for dx = 1, scale_x do
-                            gpu.setPixel(display_id, base_x + dx, base_y + dy, c1[1], c1[2], c1[3])
-                            gpu.setPixel(display_id, base_x + scale_x + dx, base_y + dy, c2[1], c2[2], c2[3])
-
-                            gpu.setPixel(display_id, base_x + dx, base_y + scale_y + dy, c3[1], c3[2], c3[3])
-                            gpu.setPixel(display_id, base_x + scale_x + dx, base_y + scale_y + dy, c4[1], c4[2], c4[3])
-
-                            gpu.setPixel(display_id, base_x + dx, base_y + 2 * scale_y + dy, c5[1], c5[2], c5[3])
-                            gpu.setPixel(display_id, base_x + scale_x + dx, base_y + 2 * scale_y + dy, c6[1], c6[2], c6[3])
+                    -- Subpixel 1: tx0 + 1 to tx1, ty0 + 1 to ty1
+                    for dy = ty0 + 1, ty1 do
+                        for dx = tx0 + 1, tx1 do
+                            gpu.setPixel(display_id, dx, dy, c1[1], c1[2], c1[3])
+                        end
+                    end
+                    -- Subpixel 2: tx1 + 1 to tx2, ty0 + 1 to ty1
+                    for dy = ty0 + 1, ty1 do
+                        for dx = tx1 + 1, tx2 do
+                            gpu.setPixel(display_id, dx, dy, c2[1], c2[2], c2[3])
+                        end
+                    end
+                    -- Subpixel 3: tx0 + 1 to tx1, ty1 + 1 to ty2
+                    for dy = ty1 + 1, ty2 do
+                        for dx = tx0 + 1, tx1 do
+                            gpu.setPixel(display_id, dx, dy, c3[1], c3[2], c3[3])
+                        end
+                    end
+                    -- Subpixel 4: tx1 + 1 to tx2, ty1 + 1 to ty2
+                    for dy = ty1 + 1, ty2 do
+                        for dx = tx1 + 1, tx2 do
+                            gpu.setPixel(display_id, dx, dy, c4[1], c4[2], c4[3])
+                        end
+                    end
+                    -- Subpixel 5: tx0 + 1 to tx1, ty2 + 1 to ty3
+                    for dy = ty2 + 1, ty3 do
+                        for dx = tx0 + 1, tx1 do
+                            gpu.setPixel(display_id, dx, dy, c5[1], c5[2], c5[3])
+                        end
+                    end
+                    -- Subpixel 6: tx1 + 1 to tx2, ty2 + 1 to ty3
+                    for dy = ty2 + 1, ty3 do
+                        for dx = tx1 + 1, tx2 do
+                            gpu.setPixel(display_id, dx, dy, c6[1], c6[2], c6[3])
                         end
                     end
 

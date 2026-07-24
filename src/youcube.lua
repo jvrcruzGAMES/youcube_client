@@ -274,7 +274,9 @@ local function get_video_size()
             video_display.width = info.pixelWidth
             video_display.height = info.pixelHeight
         end
-        return math.floor(video_display.width / 2), math.floor(video_display.height / 3)
+        local w = math.floor(video_display.width / 2)
+        local h = math.floor(video_display.height / 3)
+        return math.min(w, 328), math.min(h, 108)
     end
     return video_display.getSize()
 end
