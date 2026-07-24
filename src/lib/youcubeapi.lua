@@ -210,7 +210,7 @@ function API:hls_get_audio_chunk(media_id, segment_index)
 end
 
 function API:hls_get_video_frame(media_id, width, height, segment_index)
-    local url = self.http_base_url .. "/hls/video/" .. media_id .. "/" .. width .. "x" .. height .. "/" .. segment_index
+    local url = self:hls_video_segment_url(media_id, width, height, segment_index)
     local response, err = http.get(url, nil, true)
     if not response then
         return nil
@@ -218,6 +218,10 @@ function API:hls_get_video_frame(media_id, width, height, segment_index)
     local line = response.readAll()
     response.close()
     return line
+end
+
+function API:hls_video_segment_url(media_id, width, height, segment_index)
+    return self.http_base_url .. "/hls/video/" .. media_id .. "/" .. width .. "x" .. height .. "/" .. segment_index
 end
 
 --[[- [Base64](https://wikipedia.org/wiki/Base64) functions
@@ -308,6 +312,20 @@ function API:request_media(url, width, height, hq_audio)
     end
     self:send(request)
     --return self:receive({ ["media"] = true, ["status"] = true })
+end
+
+function API:ensure_video(url, id, width, height, hq_audio)
+    local request = {
+        ["action"] = "ensure_video",
+        ["url"] = url,
+        ["id"] = id,
+        ["width"] = width,
+        ["height"] = height,
+    }
+    if hq_audio then
+        request.hq_audio = true
+    end
+    self:send(request)
 end
 
 --- Handshake - get Server capabilities and version
@@ -572,38 +590,30 @@ function HLSAudioFiller.new(youcubeapi, id)
     local self = {
         id = id,
         youcubeapi = youcubeapi,
-        response = nil,
-        buffer = "",
-        eof = false,
+        data = nil,
+        pos = 1,
+        chunkindex = 0,
     }
 
     function self:next()
-        if not self.response then
+        if not self.data then
             local url = self.youcubeapi.http_base_url .. "/dfpwm/" .. self.id
             local resp, err = http.get(url, nil, true)
             if not resp then
                 error("Failed to connect to audio stream: " .. (err or "unknown error"))
             end
-            self.response = resp
+            self.data = resp.readAll() or ""
+            resp.close()
         end
 
-        while not self.eof and #self.buffer < 1024 do
-            local chunk = self.response.read(65536)
-            if not chunk then
-                self.eof = true
-                self.response.close()
-                break
-            end
-            self.buffer = self.buffer .. chunk
+        if self.pos > #self.data then
+            return ""
         end
 
-        if #self.buffer > 0 then
-            local chunk = self.buffer:sub(1, 1024)
-            self.buffer = self.buffer:sub(1025)
-            return chunk
-        end
-
-        return ""
+        local chunk = self.data:sub(self.pos, self.pos + 1023)
+        self.pos = self.pos + 1024
+        self.chunkindex = self.chunkindex + 1
+        return chunk
     end
 
     return self
@@ -611,64 +621,73 @@ end
 
 local HLSVideoFiller = {}
 
-function HLSVideoFiller.new(youcubeapi, id, width, height)
+function HLSVideoFiller.new(youcubeapi, id, width, height, max_segments)
     local self = {
         id = id,
         width = width,
         height = height,
         youcubeapi = youcubeapi,
-        response = nil,
-        buffer = "",
-        eof = false,
+        segment_index = 0,
+        max_segments = max_segments,
     }
 
     function self:next()
-        if not self.response then
-            local url = self.youcubeapi.http_base_url .. "/32vid/" .. self.id .. "/" .. (self.width * 2) .. "/" .. (self.height * 3)
-            local resp, err = http.get(url, nil, true)
-            if not resp then
-                error("Failed to connect to video stream: " .. (err or "unknown error"))
-            end
-            self.response = resp
+        if self.max_segments and self.segment_index >= self.max_segments then
+            return ""
         end
 
-        while not self.eof do
-            local newline_pos = self.buffer:find("\n")
-            if newline_pos then
-                local line = self.buffer:sub(1, newline_pos - 1)
-                self.buffer = self.buffer:sub(newline_pos + 1)
-                if line:sub(-1) == "\r" then
-                    line = line:sub(1, -2)
-                end
-                return { line }
-            end
-
-            local chunk = self.response.read(65536)
-            if not chunk then
-                self.eof = true
-                self.response.close()
-                break
-            end
-            self.buffer = self.buffer .. chunk
+        local url = self.youcubeapi:hls_video_segment_url(
+            self.id,
+            self.width,
+            self.height,
+            self.segment_index
+        )
+        if self.youcubeapi.is_directgpu then
+            url = url .. "?is_directgpu=true&display_width=" .. self.youcubeapi.display_width .. "&display_height=" .. self.youcubeapi.display_height
         end
 
-        if self.buffer ~= "" then
-            local newline_pos = self.buffer:find("\n")
-            local line
-            if newline_pos then
-                line = self.buffer:sub(1, newline_pos - 1)
-                self.buffer = self.buffer:sub(newline_pos + 1)
-            else
-                line = self.buffer
-                self.buffer = ""
+        local resp, err = http.get(url)
+        if not resp then
+            local is_first_segment = self.segment_index == 0
+            self.segment_index = self.segment_index + 1
+            if is_first_segment then
+                error(
+                    "Failed to fetch HLS sanjuuni frame table: "
+                        .. url
+                        .. " ("
+                        .. (err or "unknown error")
+                        .. ")"
+                )
             end
-            if line:sub(-1) == "\r" then
-                line = line:sub(1, -2)
-            end
-            return { line }
+            return ""
         end
 
-        return {}
+        local body = resp.readAll()
+        resp.close()
+        self.segment_index = self.segment_index + 1
+
+        if not body or body == "" then
+            if self.segment_index == 1 then
+                error("HLS sanjuuni frame table URL returned an empty first segment: " .. url)
+            end
+            return ""
+        end
+
+        local func, compile_err = load(body)
+        if not func then
+            error(
+                "Failed to compile HLS sanjuuni frame table from "
+                    .. url
+                    .. ": "
+                    .. (compile_err or "unknown error")
+            )
+        end
+
+        local frames = func()
+        if type(frames) ~= "table" then
+            error("HLS sanjuuni frame table URL did not return a frame table: " .. url)
+        end
+        return frames
     end
 
     return self
@@ -779,25 +798,26 @@ local function play_vid(buffer, force_fps, string_unpack, display)
     if not is_directgpu then
         palette = get_palette(display)
     end
-    local tracker = 0
 
-    if buffer:next() ~= "32Vid 1.1" then
-        error("Unsupported file")
+    local first_val = buffer:next()
+    local is_hls = type(first_val) == "table"
+
+    local fps = 30
+    local first_frame = nil
+
+    if is_hls then
+        first_frame = first_val
+        fps = first_frame.fps or 30
+    else
+        if first_val ~= "32Vid 1.1" then
+            error("Unsupported file")
+        end
+        fps = tonumber(buffer:next())
     end
-
-    local fps = tonumber(buffer:next())
     if force_fps then
         fps = force_fps
     end
 
-    -- Adjust buffer size
-    buffer.size = math.ceil(fps) * 2
-
-    local first, second = buffer:next(), buffer:next()
-
-    if second == "" or second == nil then
-        fps = 0
-    end
     if is_directgpu then
         display.gpu.clear(display.display_id, 0, 0, 0)
     else
@@ -806,151 +826,186 @@ local function play_vid(buffer, force_fps, string_unpack, display)
 
     local start = os.epoch("utc")
     local frame_count = 0
+
+    local first_legacy, second_legacy
+    if not is_hls then
+        first_legacy, second_legacy = buffer:next(), buffer:next()
+        if second_legacy == "" or second_legacy == nil then
+            fps = 0
+        end
+    end
+
     while true do
         frame_count = frame_count + 1
         local frame
-        if first then
-            frame, first = first, nil
-        elseif second then
-            frame, second = second, nil
+        if first_frame then
+            frame = first_frame
+            first_frame = nil
+        elseif first_legacy then
+            frame = first_legacy
+            first_legacy = nil
+        elseif second_legacy then
+            frame = second_legacy
+            second_legacy = nil
         else
             frame = buffer:next()
         end
+
         if frame == "" or frame == nil then
             break
         end
-        local mode = frame:match("^!CP([CD])")
-        if not mode then
-            error("Invalid file")
-        end
-        local b64data
-        if mode == "C" then
-            local len = tonumber(frame:sub(5, 8), 16)
-            b64data = frame:sub(9, len + 8)
+
+        if is_hls then
+            local frame_palette = frame.palette
+            if is_directgpu then
+                local gpu = display.gpu
+                local display_id = display.display_id
+                local draws = frame.draws
+                local draws_len = #draws
+                local draws_pos = 1
+                while draws_pos <= draws_len do
+                    local x, y, w, h, r_idx, g_idx, b_idx
+                    x, y, w, h, r_idx, g_idx, b_idx, draws_pos = string_unpack(">HHHHBBB", draws, draws_pos)
+                    gpu.fillRect(display_id, x, y, w, h, r_idx, g_idx, b_idx)
+                end
+                gpu.updateDisplay(display_id)
+            else
+                for y = 1, #frame.text do
+                    display.setCursorPos(1, y)
+                    display.blit(frame.text[y], frame.fg[y], frame.bg[y])
+                end
+                for i = 1, 16 do
+                    local color = frame_palette[i]
+                    display.setPaletteColor(2 ^ (i - 1), color[1], color[2], color[3])
+                end
+            end
         else
-            local len = tonumber(frame:sub(5, 16), 16)
-            b64data = frame:sub(17, len + 16)
-        end
-        local data = Base64.decode(b64data)
-        -- TODO: maybe verify checksums?
-        assert(data:sub(1, 4) == "\0\0\0\0" and data:sub(9, 16) == "\0\0\0\0\0\0\0\0", "Invalid file")
-        local width, height = string_unpack("HH", data, 5)
-        local c, n, pos = string_unpack("c1B", data, 17)
-        local text = {}
-        for y = 1, height do
-            text[y] = ""
-            for x = 1, width do
-                text[y] = text[y] .. c
-                n = n - 1
-                if n == 0 then
+            -- Legacy Raw WebSocket rendering
+            local mode = frame:match("^!CP([CD])")
+            if not mode then
+                error("Invalid file")
+            end
+            local b64data
+            if mode == "C" then
+                local len = tonumber(frame:sub(5, 8), 16)
+                b64data = frame:sub(9, len + 8)
+            else
+                local len = tonumber(frame:sub(5, 16), 16)
+                b64data = frame:sub(17, len + 16)
+            end
+            local data = Base64.decode(b64data)
+            assert(data:sub(1, 4) == "\0\0\0\0" and data:sub(9, 16) == "\0\0\0\0\0\0\0\0", "Invalid file")
+            local width, height = string_unpack("HH", data, 5)
+            local c, n, pos = string_unpack("c1B", data, 17)
+            local text = {}
+            local y_idx = 1
+            local line_parts = {}
+            local line_len = 0
+            while y_idx <= height do
+                local run_len = math.min(n, width - line_len)
+                line_parts[#line_parts + 1] = string.rep(c, run_len)
+                line_len = line_len + run_len
+                n = n - run_len
+                if line_len == width then
+                    text[y_idx] = table.concat(line_parts)
+                    y_idx = y_idx + 1
+                    line_parts = {}
+                    line_len = 0
+                end
+                if n == 0 and pos <= #data then
                     c, n, pos = string_unpack("c1B", data, pos)
                 end
             end
-        end
-        local frame_palette = {}
-        local palette_pos = #data - 47
-        for i = 0, 15 do
-            local r, g, b
-            r, g, b, palette_pos = string_unpack("BBB", data, palette_pos)
-            frame_palette[i] = { r, g, b }
-        end
 
-        c = c:byte()
-        if is_directgpu then
-            local gpu = display.gpu
-            local display_id = display.display_id
-            local ratio_x = display.width / (width * 2)
-            local ratio_y = display.height / (height * 3)
-
-            for y = 1, height do
-                local line_chars = text[y]
-                local ry1 = (y - 1) * 3
-                local ty0 = math.floor(ry1 * ratio_y)
-                local ty1 = math.floor((ry1 + 1) * ratio_y)
-                local ty2 = math.floor((ry1 + 2) * ratio_y)
-                local ty3 = math.floor((ry1 + 3) * ratio_y)
-
-                for x = 1, width do
-                    local char_code = line_chars:byte(x) or 32
-                    local subpixels = decode_teletext(char_code)
-                    local fg_color = frame_palette[bit32.band(c, 0x0F)]
-                    local bg_color = frame_palette[bit32.rshift(c, 4)]
-
-                    local rx1 = (x - 1) * 2
-                    local tx0 = math.floor(rx1 * ratio_x)
-                    local tx1 = math.floor((rx1 + 1) * ratio_x)
-                    local tx2 = math.floor((rx1 + 2) * ratio_x)
-
-                    -- Draw each of the 6 subpixel blocks
-                    local c1 = subpixels[1] == 1 and fg_color or bg_color
-                    local c2 = subpixels[2] == 1 and fg_color or bg_color
-                    local c3 = subpixels[3] == 1 and fg_color or bg_color
-                    local c4 = subpixels[4] == 1 and fg_color or bg_color
-                    local c5 = subpixels[5] == 1 and fg_color or bg_color
-                    local c6 = subpixels[6] == 1 and fg_color or bg_color
-
-                    -- Subpixel 1: tx0 + 1 to tx1, ty0 + 1 to ty1
-                    for dy = ty0 + 1, ty1 do
-                        for dx = tx0 + 1, tx1 do
-                            gpu.setPixel(display_id, dx, dy, c1[1], c1[2], c1[3])
-                        end
-                    end
-                    -- Subpixel 2: tx1 + 1 to tx2, ty0 + 1 to ty1
-                    for dy = ty0 + 1, ty1 do
-                        for dx = tx1 + 1, tx2 do
-                            gpu.setPixel(display_id, dx, dy, c2[1], c2[2], c2[3])
-                        end
-                    end
-                    -- Subpixel 3: tx0 + 1 to tx1, ty1 + 1 to ty2
-                    for dy = ty1 + 1, ty2 do
-                        for dx = tx0 + 1, tx1 do
-                            gpu.setPixel(display_id, dx, dy, c3[1], c3[2], c3[3])
-                        end
-                    end
-                    -- Subpixel 4: tx1 + 1 to tx2, ty1 + 1 to ty2
-                    for dy = ty1 + 1, ty2 do
-                        for dx = tx1 + 1, tx2 do
-                            gpu.setPixel(display_id, dx, dy, c4[1], c4[2], c4[3])
-                        end
-                    end
-                    -- Subpixel 5: tx0 + 1 to tx1, ty2 + 1 to ty3
-                    for dy = ty2 + 1, ty3 do
-                        for dx = tx0 + 1, tx1 do
-                            gpu.setPixel(display_id, dx, dy, c5[1], c5[2], c5[3])
-                        end
-                    end
-                    -- Subpixel 6: tx1 + 1 to tx2, ty2 + 1 to ty3
-                    for dy = ty2 + 1, ty3 do
-                        for dx = tx1 + 1, tx2 do
-                            gpu.setPixel(display_id, dx, dy, c6[1], c6[2], c6[3])
-                        end
-                    end
-
-                    n = n - 1
-                    if n == 0 then
-                        c, n, pos = string_unpack("BB", data, pos)
-                    end
-                end
-            end
-            gpu.updateDisplay(display_id)
-        else
-            for y = 1, height do
-                local fg, bg = "", ""
-                for x = 1, width do
-                    fg, bg = fg .. ("%x"):format(bit32.band(c, 0x0F)), bg .. ("%x"):format(bit32.rshift(c, 4))
-                    n = n - 1
-                    if n == 0 then
-                        c, n, pos = string_unpack("BB", data, pos)
-                    end
-                end
-                display.setCursorPos(1, y)
-                display.blit(text[y], fg, bg)
-            end
+            local frame_palette = {}
+            local palette_pos = #data - 47
+            local colors = { string_unpack("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", data, palette_pos) }
             for i = 0, 15 do
-                local color = frame_palette[i]
-                display.setPaletteColor(2 ^ i, color[1] / 255, color[2] / 255, color[3] / 255)
+                frame_palette[i] = { colors[i*3 + 1], colors[i*3 + 2], colors[i*3 + 3] }
+            end
+
+            c = c:byte()
+            local hex = { [0]="0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f" }
+            if is_directgpu then
+                local gpu = display.gpu
+                local display_id = display.display_id
+                local ratio_x = display.width / (width * 2)
+                local ratio_y = display.height / (height * 3)
+
+                for y = 1, height do
+                    local line_chars = text[y]
+                    local ry1 = (y - 1) * 3
+                    local ty0 = math.floor(ry1 * ratio_y)
+                    local ty1 = math.floor((ry1 + 1) * ratio_y)
+                    local ty2 = math.floor((ry1 + 2) * ratio_y)
+                    local ty3 = math.floor((ry1 + 3) * ratio_y)
+
+                    for x = 1, width do
+                        local char_code = line_chars:byte(x) or 32
+                        local fg_color = frame_palette[bit32.band(c, 0x0F)]
+                        local bg_color = frame_palette[bit32.rshift(c, 4)]
+
+                        local rx1 = (x - 1) * 2
+                        local tx0 = math.floor(rx1 * ratio_x)
+                        local tx1 = math.floor((rx1 + 1) * ratio_x)
+                        local tx2 = math.floor((rx1 + 2) * ratio_x)
+
+                        if char_code == 32 then
+                            gpu.fillRect(display_id, tx0 + 1, ty0 + 1, tx2 - tx0, ty3 - ty0, bg_color[1], bg_color[2], bg_color[3])
+                        elseif char_code == 219 then
+                            gpu.fillRect(display_id, tx0 + 1, ty0 + 1, tx2 - tx0, ty3 - ty0, fg_color[1], fg_color[2], fg_color[3])
+                        else
+                            local subpixels = decode_teletext(char_code)
+                            gpu.fillRect(display_id, tx0 + 1, ty0 + 1, tx2 - tx0, ty3 - ty0, bg_color[1], bg_color[2], bg_color[3])
+
+                            if subpixels[1] == 1 then
+                                gpu.fillRect(display_id, tx0 + 1, ty0 + 1, tx1 - tx0, ty1 - ty0, fg_color[1], fg_color[2], fg_color[3])
+                            end
+                            if subpixels[2] == 1 then
+                                gpu.fillRect(display_id, tx1 + 1, ty0 + 1, tx2 - tx1, ty1 - ty0, fg_color[1], fg_color[2], fg_color[3])
+                            end
+                            if subpixels[3] == 1 then
+                                gpu.fillRect(display_id, tx0 + 1, ty1 + 1, tx1 - tx0, ty2 - ty1, fg_color[1], fg_color[2], fg_color[3])
+                            end
+                            if subpixels[4] == 1 then
+                                gpu.fillRect(display_id, tx1 + 1, ty1 + 1, tx2 - tx1, ty2 - ty1, fg_color[1], fg_color[2], fg_color[3])
+                            end
+                            if subpixels[5] == 1 then
+                                gpu.fillRect(display_id, tx0 + 1, ty2 + 1, tx1 - tx0, ty3 - ty2, fg_color[1], fg_color[2], fg_color[3])
+                            end
+                            if subpixels[6] == 1 then
+                                gpu.fillRect(display_id, tx1 + 1, ty2 + 1, tx2 - tx1, ty3 - ty2, fg_color[1], fg_color[2], fg_color[3])
+                            end
+                        end
+
+                        n = n - 1
+                        if n == 0 then
+                            c, n, pos = string_unpack("BB", data, pos)
+                        end
+                    end
+                end
+                gpu.updateDisplay(display_id)
+            else
+                for y = 1, height do
+                    local fg_tbl, bg_tbl = {}, {}
+                    for x = 1, width do
+                        fg_tbl[x] = hex[bit32.band(c, 0x0F)]
+                        bg_tbl[x] = hex[bit32.rshift(c, 4)]
+                        n = n - 1
+                        if n == 0 then
+                            c, n, pos = string_unpack("BB", data, pos)
+                        end
+                    end
+                    display.setCursorPos(1, y)
+                    display.blit(text[y], table.concat(fg_tbl), table.concat(bg_tbl))
+                end
+                for i = 0, 15 do
+                    local color = frame_palette[i]
+                    display.setPaletteColor(2 ^ i, color[1] / 255, color[2] / 255, color[3] / 255)
+                end
             end
         end
+
         if fps == 0 then
             read()
             break

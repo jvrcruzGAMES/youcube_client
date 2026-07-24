@@ -124,18 +124,16 @@ parser:option "--fps"
     :description "Force sanjuuni to use a specified frame rate"
     :target "force_fps"
 
-parser:flag "--hls"
-    :description "Enables non-standard HTTP Live Streaming (HLS) mode."
-    :target "hls"
+parser:flag "--no-hls"
+    :description "Disables HTTP Live Streaming (HLS) mode, using legacy WebSocket instead."
+    :target "no_hls"
     :action "store_true"
 
 -- stylua: ignore end
 
 local args = parser:parse({ ... })
 
-if args.server and (args.server:match("^http://") or args.server:match("^https://")) then
-    args.hls = true
-end
+local use_hls = not args.no_hls
 
 if args.force_fps then
     args.force_fps = tonumber(args.force_fps)
@@ -513,18 +511,12 @@ local function play(url)
     print("Requesting media ...")
 
     local data
-    if args.hls then
-        local width, height
-        if not args.no_video then
-            width, height = get_video_size()
-        end
-        print("Status: Requesting and converting (HLS) ...")
-        local success, err = pcall(function()
-            data = youcubeapi:hls_request(url, width, height, can_play_hq_audio())
-        end)
-        if not success then
-            error(err or "Failed to request HLS stream")
-        end
+    local hls_video_width, hls_video_height
+    if use_hls and not args.no_video then
+        local width, height = get_video_size()
+        hls_video_width = width * 2
+        hls_video_height = height * 3
+        youcubeapi:request_media(url, width, height, can_play_hq_audio())
     else
         if not args.no_video then
             local width, height = get_video_size()
@@ -532,8 +524,39 @@ local function play(url)
         else
             youcubeapi:request_media(url, nil, nil, can_play_hq_audio())
         end
+    end
 
-        local x, y = term.getCursorPos()
+    local x, y = term.getCursorPos()
+    repeat
+        data = youcubeapi:receive()
+        if data.action == "status" then
+            os.queueEvent("youcube:status", data)
+            term.setCursorPos(x, y)
+            term.clearLine()
+            term.write("Status: ")
+            write_colored(data.message, colors.green)
+            term.setTextColor(colors.white)
+        else
+            new_line()
+        end
+    until data.action == "media" or data.action == "error"
+
+    if not data or data.action == "error" then
+        error(data and data.message or "An error occurred during HLS request")
+    end
+
+    local media_data = data
+    if use_hls and not args.no_video then
+        hls_video_width = data.video_width or hls_video_width
+        hls_video_height = data.video_height or hls_video_height
+        youcubeapi:ensure_video(
+            url,
+            data.id,
+            hls_video_width,
+            hls_video_height,
+            can_play_hq_audio()
+        )
+
         repeat
             data = youcubeapi:receive()
             if data.action == "status" then
@@ -546,11 +569,15 @@ local function play(url)
             else
                 new_line()
             end
-        until data.action == "media"
-    end
+        until data.action == "video_ready" or data.action == "error"
 
-    if not data or data.action == "error" then
-        error(data and data.message or "An error occurred during HLS request")
+        if data.action == "error" then
+            error(data.message or "Failed to ensure HLS video frame source")
+        end
+        media_data.video_width = data.video_width
+        media_data.video_height = data.video_height
+        media_data.video_segments_count = data.video_segments_count
+        data = media_data
     end
 
     term.write("Playing: ")
@@ -585,10 +612,27 @@ local function play(url)
     local use_stereo = left_speaker_attached and right_speaker_attached and not args.no_audio
 
     local video_buffer, audio_buffer, audio_buffer_left, audio_buffer_right
-    if args.hls then
-        local w, h = get_video_size()
+    if use_hls then
+        hls_video_width = data.video_width or hls_video_width
+        hls_video_height = data.video_height or hls_video_height
+        if not hls_video_width or not hls_video_height then
+            local w, h = get_video_size()
+            hls_video_width = w * 2
+            hls_video_height = h * 3
+        end
+        youcubeapi.is_directgpu = (video_display.type == "directgpu")
+        if youcubeapi.is_directgpu then
+            youcubeapi.display_width = video_display.width
+            youcubeapi.display_height = video_display.height
+        end
         video_buffer = libs.youcubeapi.Buffer.new(
-            libs.youcubeapi.HLSVideoFiller.new(youcubeapi, data.id, w, h),
+            libs.youcubeapi.HLSVideoFiller.new(
+                youcubeapi,
+                data.id,
+                hls_video_width,
+                hls_video_height,
+                data.video_segments_count
+            ),
             60
         )
         if use_stereo then
@@ -625,6 +669,29 @@ local function play(url)
                 libs.youcubeapi.AudioFiller.new(youcubeapi, data.id),
                 32
             )
+        end
+    end
+
+    -- Pre-fill video and audio buffers to prevent dry starvation on start
+    if not args.no_video and video_buffer then
+        for i = 1, 30 do
+            video_buffer:fill()
+        end
+    end
+    if not args.no_audio then
+        if use_stereo then
+            if audio_buffer_left and audio_buffer_right then
+                for i = 1, 10 do
+                    audio_buffer_left:fill()
+                    audio_buffer_right:fill()
+                end
+            end
+        else
+            if audio_buffer then
+                for i = 1, 10 do
+                    audio_buffer:fill()
+                end
+            end
         end
     end
 
