@@ -406,6 +406,53 @@ local function play_audio(buffer, title)
     end
 end
 
+local function play_audio_stereo(buffer_left, buffer_right, title)
+    local left_device, right_device
+    for i = 1, #audiodevices do
+        local side = audiodevices[i].speaker and peripheral.getName(audiodevices[i].speaker)
+        if side == "left" then
+            left_device = audiodevices[i]
+        elseif side == "right" then
+            right_device = audiodevices[i]
+        end
+    end
+
+    left_device:reset()
+    left_device:setLabel(title)
+    left_device:setVolume(args.volume)
+
+    right_device:reset()
+    right_device:setLabel(title)
+    right_device:setVolume(args.volume)
+
+    while true do
+        local chunk_left = buffer_left:next()
+        local chunk_right = buffer_right:next()
+
+        -- Adjust buffer size on first chunk
+        if buffer_left.filler.chunkindex == 1 then
+            buffer_left.size = math.ceil(1024 / (#chunk_left / 16))
+        end
+        if buffer_right.filler.chunkindex == 1 then
+            buffer_right.size = math.ceil(1024 / (#chunk_right / 16))
+        end
+
+        if chunk_left == "" or chunk_right == "" then
+            parallel.waitForAll(
+                function() left_device:play() end,
+                function() right_device:play() end
+            )
+            return
+        end
+
+        parallel.waitForAll(
+            -- Left speaker plays right channel, right speaker plays left channel
+            function() left_device:write(chunk_right) end,
+            function() right_device:write(chunk_left) end
+        )
+    end
+end
+
 local function can_play_hq_audio()
     for i = 1, #audiodevices do
         if audiodevices[i].playUrl then
@@ -498,15 +545,40 @@ local function play(url)
         60 -- Most videos run on 30 fps, so we store 2s of video.
     )
 
-    local audio_buffer = libs.youcubeapi.Buffer.new(
-        libs.youcubeapi.AudioFiller.new(youcubeapi, data.id),
-        --[[
-            We want to buffer 1024 chunks.
-            One chunks is 16 bits.
-            The server (with default settings) sends 32 chunks at once.
-        ]]
-        32
-    )
+    local left_speaker_attached = false
+    local right_speaker_attached = false
+    for i = 1, #audiodevices do
+        local side = audiodevices[i].speaker and peripheral.getName(audiodevices[i].speaker)
+        if side == "left" then
+            left_speaker_attached = true
+        elseif side == "right" then
+            right_speaker_attached = true
+        end
+    end
+
+    local use_stereo = left_speaker_attached and right_speaker_attached and not args.no_audio
+
+    local audio_buffer, audio_buffer_left, audio_buffer_right
+    if use_stereo then
+        audio_buffer_left = libs.youcubeapi.Buffer.new(
+            libs.youcubeapi.AudioFiller.new(youcubeapi, data.id .. "_left"),
+            32
+        )
+        audio_buffer_right = libs.youcubeapi.Buffer.new(
+            libs.youcubeapi.AudioFiller.new(youcubeapi, data.id .. "_right"),
+            32
+        )
+    else
+        audio_buffer = libs.youcubeapi.Buffer.new(
+            libs.youcubeapi.AudioFiller.new(youcubeapi, data.id),
+            --[[
+                We want to buffer 1024 chunks.
+                One chunks is 16 bits.
+                The server (with default settings) sends 32 chunks at once.
+            ]]
+            32
+        )
+    end
 
     if args.verbose then
         term.clear()
@@ -525,13 +597,22 @@ local function play(url)
             end
 
             if not args.no_audio then
-                audio_buffer:fill()
+                if use_stereo then
+                    audio_buffer_left:fill()
+                    audio_buffer_right:fill()
+                else
+                    audio_buffer:fill()
+                end
             end
 
             if args.verbose then
                 term.setCursorPos(1, ({ term.getSize() })[2])
                 term.clearLine()
-                term.write("Audio_Buffer: " .. #audio_buffer.buffer)
+                if use_stereo then
+                    term.write("Audio_Buffer_L: " .. #audio_buffer_left.buffer .. " R: " .. #audio_buffer_right.buffer)
+                else
+                    term.write("Audio_Buffer: " .. #audio_buffer.buffer)
+                end
             end
 
             if not args.no_video then
@@ -559,7 +640,11 @@ local function play(url)
             if data.audio_url and can_play_hq_audio() then
                 play_hq_audio(data.audio_url, data.title)
             else
-                play_audio(audio_buffer, data.title)
+                if use_stereo then
+                    play_audio_stereo(audio_buffer_left, audio_buffer_right, data.title)
+                else
+                    play_audio(audio_buffer, data.title)
+                end
             end
             os.queueEvent("youcube:audio_eof", data)
         end

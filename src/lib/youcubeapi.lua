@@ -554,6 +554,28 @@ local function reset_term(display, palette)
     display.setCursorPos(1, 1)
 end
 
+local function decode_teletext(char_code)
+    local subpixels = {0, 0, 0, 0, 0, 0}
+    if char_code >= 128 and char_code <= 159 then
+        local pattern = char_code - 128
+        subpixels[6] = 0
+        subpixels[1] = bit32.band(pattern, 1) ~= 0 and 1 or 0
+        subpixels[2] = bit32.band(pattern, 2) ~= 0 and 1 or 0
+        subpixels[3] = bit32.band(pattern, 4) ~= 0 and 1 or 0
+        subpixels[4] = bit32.band(pattern, 8) ~= 0 and 1 or 0
+        subpixels[5] = bit32.band(pattern, 16) ~= 0 and 1 or 0
+    elseif char_code >= 224 and char_code <= 255 then
+        local pattern = char_code - 224
+        subpixels[6] = 1
+        subpixels[1] = bit32.band(pattern, 1) == 0 and 1 or 0
+        subpixels[2] = bit32.band(pattern, 2) == 0 and 1 or 0
+        subpixels[3] = bit32.band(pattern, 4) == 0 and 1 or 0
+        subpixels[4] = bit32.band(pattern, 8) == 0 and 1 or 0
+        subpixels[5] = bit32.band(pattern, 16) == 0 and 1 or 0
+    end
+    return subpixels
+end
+
 --[[- Create's a new Buffer instance.
 
     Based on [sanjuuni/raw-player.lua](https://github.com/MCJack123/sanjuuni/blob/c64f8725a9f24dec656819923457717dfb964515/raw-player.lua)
@@ -651,9 +673,32 @@ local function play_vid(buffer, force_fps, string_unpack, display)
             local gpu = display.gpu
             local display_id = display.display_id
             for y = 1, height do
+                local line_chars = text[y]
                 for x = 1, width do
-                    local color = frame_palette[bit32.rshift(c, 4)]
-                    gpu.setPixel(display_id, x, y, color[1], color[2], color[3])
+                    local char_code = line_chars:byte(x) or 32
+                    local subpixels = decode_teletext(char_code)
+                    local fg_color = frame_palette[bit32.band(c, 0x0F)]
+                    local bg_color = frame_palette[bit32.rshift(c, 4)]
+
+                    -- Draw 6 subpixels
+                    local c1 = subpixels[1] == 1 and fg_color or bg_color
+                    gpu.setPixel(display_id, (x - 1) * 2 + 1, (y - 1) * 3 + 1, c1[1], c1[2], c1[3])
+
+                    local c2 = subpixels[2] == 1 and fg_color or bg_color
+                    gpu.setPixel(display_id, (x - 1) * 2 + 2, (y - 1) * 3 + 1, c2[1], c2[2], c2[3])
+
+                    local c3 = subpixels[3] == 1 and fg_color or bg_color
+                    gpu.setPixel(display_id, (x - 1) * 2 + 1, (y - 1) * 3 + 2, c3[1], c3[2], c3[3])
+
+                    local c4 = subpixels[4] == 1 and fg_color or bg_color
+                    gpu.setPixel(display_id, (x - 1) * 2 + 2, (y - 1) * 3 + 2, c4[1], c4[2], c4[3])
+
+                    local c5 = subpixels[5] == 1 and fg_color or bg_color
+                    gpu.setPixel(display_id, (x - 1) * 2 + 1, (y - 1) * 3 + 3, c5[1], c5[2], c5[3])
+
+                    local c6 = subpixels[6] == 1 and fg_color or bg_color
+                    gpu.setPixel(display_id, (x - 1) * 2 + 2, (y - 1) * 3 + 3, c6[1], c6[2], c6[3])
+
                     n = n - 1
                     if n == 0 then
                         c, n, pos = string_unpack("BB", data, pos)
