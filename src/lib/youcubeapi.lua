@@ -565,7 +565,11 @@ local function play_vid(buffer, force_fps, string_unpack, display)
         string_unpack = string.unpack
     end
     display = display or term
-    local palette = get_palette(display)
+    local is_directgpu = type(display) == "table" and display.type == "directgpu"
+    local palette
+    if not is_directgpu then
+        palette = get_palette(display)
+    end
     local tracker = 0
 
     if buffer:next() ~= "32Vid 1.1" then
@@ -585,7 +589,11 @@ local function play_vid(buffer, force_fps, string_unpack, display)
     if second == "" or second == nil then
         fps = 0
     end
-    display.clear()
+    if is_directgpu then
+        display.gpu.clear(display.display_id, 0, 0, 0)
+    else
+        display.clear()
+    end
 
     local start = os.epoch("utc")
     local frame_count = 0
@@ -630,24 +638,46 @@ local function play_vid(buffer, force_fps, string_unpack, display)
                 end
             end
         end
+        local frame_palette = {}
+        local palette_pos = #data - 47
+        for i = 0, 15 do
+            local r, g, b
+            r, g, b, palette_pos = string_unpack("BBB", data, palette_pos)
+            frame_palette[i] = { r, g, b }
+        end
+
         c = c:byte()
-        for y = 1, height do
-            local fg, bg = "", ""
-            for x = 1, width do
-                fg, bg = fg .. ("%x"):format(bit32.band(c, 0x0F)), bg .. ("%x"):format(bit32.rshift(c, 4))
-                n = n - 1
-                if n == 0 then
-                    c, n, pos = string_unpack("BB", data, pos)
+        if is_directgpu then
+            local gpu = display.gpu
+            local display_id = display.display_id
+            for y = 1, height do
+                for x = 1, width do
+                    local color = frame_palette[bit32.rshift(c, 4)]
+                    gpu.setPixel(display_id, x, y, color[1], color[2], color[3])
+                    n = n - 1
+                    if n == 0 then
+                        c, n, pos = string_unpack("BB", data, pos)
+                    end
                 end
             end
-            display.setCursorPos(1, y)
-            display.blit(text[y], fg, bg)
-        end
-        pos = pos - 2
-        local r, g, b
-        for i = 0, 15 do
-            r, g, b, pos = string_unpack("BBB", data, pos)
-            display.setPaletteColor(2 ^ i, r / 255, g / 255, b / 255)
+            gpu.updateDisplay(display_id)
+        else
+            for y = 1, height do
+                local fg, bg = "", ""
+                for x = 1, width do
+                    fg, bg = fg .. ("%x"):format(bit32.band(c, 0x0F)), bg .. ("%x"):format(bit32.rshift(c, 4))
+                    n = n - 1
+                    if n == 0 then
+                        c, n, pos = string_unpack("BB", data, pos)
+                    end
+                end
+                display.setCursorPos(1, y)
+                display.blit(text[y], fg, bg)
+            end
+            for i = 0, 15 do
+                local color = frame_palette[i]
+                display.setPaletteColor(2 ^ i, color[1] / 255, color[2] / 255, color[3] / 255)
+            end
         end
         if fps == 0 then
             read()
@@ -658,7 +688,12 @@ local function play_vid(buffer, force_fps, string_unpack, display)
             end
         end
     end
-    reset_term(display, palette)
+    if is_directgpu then
+        display.gpu.clear(display.display_id, 0, 0, 0)
+        display.gpu.updateDisplay(display.display_id)
+    else
+        reset_term(display, palette)
+    end
 end
 
 return {

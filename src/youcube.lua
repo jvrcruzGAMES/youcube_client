@@ -216,6 +216,28 @@ local youcubeapi = libs.youcubeapi.API.new()
 local audiodevices = get_audiodevices()
 
 local function get_video_display()
+    local gpu = peripheral and peripheral.find and peripheral.find("directgpu")
+    if gpu then
+        local multiplier = settings.get("youcube.directgpu.resolution_multiplier") or 1
+        local ok, display_id = pcall(gpu.autoDetectAndCreateDisplayWithResolution, multiplier)
+        if not ok or not display_id then
+            ok, display_id = pcall(gpu.autoDetectAndCreateDisplay)
+        end
+
+        if ok and display_id then
+            local info_ok, info = pcall(gpu.getDisplayInfo, display_id)
+            if info_ok and info and info.pixelWidth and info.pixelHeight then
+                return {
+                    type = "directgpu",
+                    gpu = gpu,
+                    display_id = display_id,
+                    width = info.pixelWidth,
+                    height = info.pixelHeight,
+                }
+            end
+        end
+    end
+
     if peripheral and peripheral.getType and peripheral.getType("back") == "monitor" then
         local display = peripheral.wrap("back")
         if display then
@@ -228,7 +250,19 @@ end
 local video_display = get_video_display()
 
 local function reset_video_display()
-    libs.youcubeapi.reset_term(video_display)
+    if video_display.type == "directgpu" then
+        video_display.gpu.clear(video_display.display_id, 0, 0, 0)
+        video_display.gpu.updateDisplay(video_display.display_id)
+    else
+        libs.youcubeapi.reset_term(video_display)
+    end
+end
+
+local function get_video_size()
+    if video_display.type == "directgpu" then
+        return video_display.width, video_display.height
+    end
+    return video_display.getSize()
 end
 
 -- update check --
@@ -414,7 +448,7 @@ local function play(url)
     print("Requesting media ...")
 
     if not args.no_video then
-        local width, height = video_display.getSize()
+        local width, height = get_video_size()
         youcubeapi:request_media(url, width, height, can_play_hq_audio())
     else
         youcubeapi:request_media(url, nil, nil, can_play_hq_audio())
@@ -460,7 +494,7 @@ local function play(url)
     end
 
     local video_buffer = libs.youcubeapi.Buffer.new(
-        libs.youcubeapi.VideoFiller.new(youcubeapi, data.id, video_display.getSize()),
+        libs.youcubeapi.VideoFiller.new(youcubeapi, data.id, get_video_size()),
         60 -- Most videos run on 30 fps, so we store 2s of video.
     )
 
