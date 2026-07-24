@@ -93,6 +93,7 @@ function API:detect_bestest_server(_server, _verbose)
                 print(server)
                 term.setTextColor(colors.white)
                 self.websocket = websocket
+                self.http_base_url = server:gsub("^ws://", "http://"):gsub("^wss://", "https://")
                 break
             elseif i == #servers then
                 error(websocket_error)
@@ -111,42 +112,112 @@ end
 -- @tparam string filter action filter
 -- @treturn table retval data
 function API:receive(filter)
-    local status, retval = pcall(self.websocket.receive)
-    if not status then
-        error("Lost connection to server\n" .. retval)
-    end
+    self.queues = self.queues or {}
+    
+    while true do
+        -- Check if we already have a queued message for this filter
+        if filter and self.queues[filter] and #self.queues[filter] > 0 then
+            return table.remove(self.queues[filter], 1)
+        end
+        
+        -- If another coroutine is currently reading from the websocket, we must yield and wait
+        if self.reading then
+            os.pullEvent("youcube:ws_message")
+        else
+            -- We take the lock
+            self.reading = true
+            
+            local status, retval = pcall(self.websocket.receive)
+            self.reading = false
+            -- Notify other waiting coroutines that a message was processed
+            os.queueEvent("youcube:ws_message")
+            
+            if not status then
+                error("Lost connection to server\n" .. retval)
+            end
 
-    if retval == nil then
-        error("Received empty message or max message size exceeded")
-    end
+            if retval == nil then
+                error("Received empty message or max message size exceeded")
+            end
 
-    local data, err = textutils.unserialiseJSON(retval)
-
-    if data == nil then
-        error("Failed to parse message\n" .. err)
-    end
-
-    if filter then
-        --if type(filter) == "table" then
-        --    if not filter[data.action] then
-        --        return self:receive(filter)
-        --    end
-        --else
-        if data.action ~= filter then
-            return self:receive(filter)
+            local data, err = textutils.unserialiseJSON(retval)
+            if data == nil then
+                error("Failed to parse message\n" .. err)
+            end
+            
+            if filter and data.action ~= filter then
+                -- Queue it for the other action
+                self.queues[data.action] = self.queues[data.action] or {}
+                table.insert(self.queues[data.action], data)
+            else
+                return data
+            end
         end
     end
-
-    return data
 end
 
---- Send data to The YouCub Server
--- @tparam table data data to send
+function API:close()
+    if self.websocket then
+        pcall(self.websocket.close)
+        self.websocket = nil
+    end
+    self.queues = {}
+    self.reading = false
+end
+
 function API:send(data)
     local status, retval = pcall(self.websocket.send, textutils.serialiseJSON(data))
     if not status then
         error("Lost connection to server\n" .. retval)
     end
+end
+
+function API:hls_request(url, width, height, hq_audio)
+    local query = "?url=" .. textutils.urlEncode(url)
+    if width then
+        query = query .. "&width=" .. width
+    end
+    if height then
+        query = query .. "&height=" .. height
+    end
+    if hq_audio then
+        query = query .. "&hq_audio=true"
+    end
+
+    local response, err = http.get(self.http_base_url .. "/hls/request" .. query, nil, true)
+    if not response then
+        error("HTTP HLS request failed: " .. (err or "unknown error"))
+    end
+    local body = response.readAll()
+    response.close()
+
+    local data = textutils.unserialiseJSON(body)
+    if not data then
+        error("Failed to parse HTTP HLS response: " .. body)
+    end
+    return data
+end
+
+function API:hls_get_audio_chunk(media_id, segment_index)
+    local url = self.http_base_url .. "/hls/audio/" .. media_id .. "/" .. segment_index
+    local response, err = http.get(url, nil, true)
+    if not response then
+        return ""
+    end
+    local chunk = response.readAll()
+    response.close()
+    return chunk
+end
+
+function API:hls_get_video_frame(media_id, width, height, segment_index)
+    local url = self.http_base_url .. "/hls/video/" .. media_id .. "/" .. width .. "x" .. height .. "/" .. segment_index
+    local response, err = http.get(url, nil, true)
+    if not response then
+        return nil
+    end
+    local line = response.readAll()
+    response.close()
+    return line
 end
 
 --[[- [Base64](https://wikipedia.org/wiki/Base64) functions
@@ -297,9 +368,13 @@ end
 -- @treturn AudioDevice|Speaker instance
 function Speaker.new(speaker)
     local self = AudioDevice.new({ speaker = speaker })
+    local local_decoder
+    if dfpwm then
+        local_decoder = dfpwm.make_decoder()
+    end
 
     function self:validate()
-        if not decoder then
+        if not local_decoder then
             return "This ComputerCraft version dos not support DFPWM"
         end
     end
@@ -309,9 +384,13 @@ function Speaker.new(speaker)
     end
 
     function self:write(chunk)
-        local buffer = decoder(chunk)
+        local buffer = local_decoder(chunk)
+        local my_name = peripheral.getName(self.speaker)
         while not self.speaker.playAudio(buffer, self.volume) do
-            os.pullEvent("speaker_audio_empty")
+            local event, name
+            repeat
+                event, name = os.pullEvent("speaker_audio_empty")
+            until name == my_name
         end
     end
 
@@ -482,6 +561,55 @@ function VideoFiller.new(youcubeapi, id, width, height)
             self.tracker = self.tracker + #response.lines[i] + 1
         end
         return response.lines
+    end
+
+    return self
+end
+
+local HLSAudioFiller = {}
+
+function HLSAudioFiller.new(youcubeapi, id, max_segments)
+    local self = {
+        id = id,
+        chunkindex = 0,
+        youcubeapi = youcubeapi,
+        max_segments = max_segments,
+    }
+
+    function self:next()
+        if self.max_segments and self.chunkindex >= self.max_segments then
+            return ""
+        end
+        local response = self.youcubeapi:hls_get_audio_chunk(self.id, self.chunkindex)
+        self.chunkindex = self.chunkindex + 1
+        return response
+    end
+
+    return self
+end
+
+local HLSVideoFiller = {}
+
+function HLSVideoFiller.new(youcubeapi, id, width, height, max_segments)
+    local self = {
+        id = id,
+        width = width,
+        height = height,
+        chunkindex = 0,
+        youcubeapi = youcubeapi,
+        max_segments = max_segments,
+    }
+
+    function self:next()
+        if self.max_segments and self.chunkindex >= self.max_segments then
+            return {}
+        end
+        local line = self.youcubeapi:hls_get_video_frame(self.id, self.width, self.height, self.chunkindex)
+        self.chunkindex = self.chunkindex + 1
+        if not line or line == "" then
+            return {}
+        end
+        return { line }
     end
 
     return self
@@ -672,6 +800,11 @@ local function play_vid(buffer, force_fps, string_unpack, display)
         if is_directgpu then
             local gpu = display.gpu
             local display_id = display.display_id
+            local scale_x = math.max(1, math.floor(display.width / (width * 2)))
+            local scale_y = math.max(1, math.floor(display.height / (height * 3)))
+            local offset_x = math.floor((display.width - (width * 2 * scale_x)) / 2)
+            local offset_y = math.floor((display.height - (height * 3 * scale_y)) / 2)
+
             for y = 1, height do
                 local line_chars = text[y]
                 for x = 1, width do
@@ -680,24 +813,30 @@ local function play_vid(buffer, force_fps, string_unpack, display)
                     local fg_color = frame_palette[bit32.band(c, 0x0F)]
                     local bg_color = frame_palette[bit32.rshift(c, 4)]
 
-                    -- Draw 6 subpixels
+                    -- Calculate the base coordinates for the character cell on the screen
+                    local base_x = offset_x + (x - 1) * 2 * scale_x
+                    local base_y = offset_y + (y - 1) * 3 * scale_y
+
+                    -- Draw each of the 6 subpixel blocks
                     local c1 = subpixels[1] == 1 and fg_color or bg_color
-                    gpu.setPixel(display_id, (x - 1) * 2 + 1, (y - 1) * 3 + 1, c1[1], c1[2], c1[3])
-
                     local c2 = subpixels[2] == 1 and fg_color or bg_color
-                    gpu.setPixel(display_id, (x - 1) * 2 + 2, (y - 1) * 3 + 1, c2[1], c2[2], c2[3])
-
                     local c3 = subpixels[3] == 1 and fg_color or bg_color
-                    gpu.setPixel(display_id, (x - 1) * 2 + 1, (y - 1) * 3 + 2, c3[1], c3[2], c3[3])
-
                     local c4 = subpixels[4] == 1 and fg_color or bg_color
-                    gpu.setPixel(display_id, (x - 1) * 2 + 2, (y - 1) * 3 + 2, c4[1], c4[2], c4[3])
-
                     local c5 = subpixels[5] == 1 and fg_color or bg_color
-                    gpu.setPixel(display_id, (x - 1) * 2 + 1, (y - 1) * 3 + 3, c5[1], c5[2], c5[3])
-
                     local c6 = subpixels[6] == 1 and fg_color or bg_color
-                    gpu.setPixel(display_id, (x - 1) * 2 + 2, (y - 1) * 3 + 3, c6[1], c6[2], c6[3])
+
+                    for dy = 1, scale_y do
+                        for dx = 1, scale_x do
+                            gpu.setPixel(display_id, base_x + dx, base_y + dy, c1[1], c1[2], c1[3])
+                            gpu.setPixel(display_id, base_x + scale_x + dx, base_y + dy, c2[1], c2[2], c2[3])
+
+                            gpu.setPixel(display_id, base_x + dx, base_y + scale_y + dy, c3[1], c3[2], c3[3])
+                            gpu.setPixel(display_id, base_x + scale_x + dx, base_y + scale_y + dy, c4[1], c4[2], c4[3])
+
+                            gpu.setPixel(display_id, base_x + dx, base_y + 2 * scale_y + dy, c5[1], c5[2], c5[3])
+                            gpu.setPixel(display_id, base_x + scale_x + dx, base_y + 2 * scale_y + dy, c6[1], c6[2], c6[3])
+                        end
+                    end
 
                     n = n - 1
                     if n == 0 then
@@ -761,6 +900,8 @@ return {
     Filler = Filler,
     AudioFiller = AudioFiller,
     VideoFiller = VideoFiller,
+    HLSAudioFiller = HLSAudioFiller,
+    HLSVideoFiller = HLSVideoFiller,
     Buffer = Buffer,
     play_vid = play_vid,
     reset_term = reset_term,

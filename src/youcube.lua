@@ -124,9 +124,18 @@ parser:option "--fps"
     :description "Force sanjuuni to use a specified frame rate"
     :target "force_fps"
 
+parser:flag "--hls"
+    :description "Enables non-standard HTTP Live Streaming (HLS) mode."
+    :target "hls"
+    :action "store_true"
+
 -- stylua: ignore end
 
 local args = parser:parse({ ... })
+
+if args.server and (args.server:match("^http://") or args.server:match("^https://")) then
+    args.hls = true
+end
 
 if args.force_fps then
     args.force_fps = tonumber(args.force_fps)
@@ -260,7 +269,12 @@ end
 
 local function get_video_size()
     if video_display.type == "directgpu" then
-        return video_display.width, video_display.height
+        local info_ok, info = pcall(video_display.gpu.getDisplayInfo, video_display.display_id)
+        if info_ok and info and info.pixelWidth and info.pixelHeight then
+            video_display.width = info.pixelWidth
+            video_display.height = info.pixelHeight
+        end
+        return math.floor(video_display.width / 2), math.floor(video_display.height / 3)
     end
     return video_display.getSize()
 end
@@ -492,34 +506,49 @@ local back_key = settings.get("youcube.keys.back") or keys.a
 
 local function play(url)
     restart = false
+    youcubeapi:close()
+    youcubeapi:detect_bestest_server(args.server, args.verbose)
     print("Requesting media ...")
 
-    if not args.no_video then
-        local width, height = get_video_size()
-        youcubeapi:request_media(url, width, height, can_play_hq_audio())
+    local data
+    if args.hls then
+        local width, height
+        if not args.no_video then
+            width, height = get_video_size()
+        end
+        print("Status: Requesting and converting (HLS) ...")
+        local success, err = pcall(function()
+            data = youcubeapi:hls_request(url, width, height, can_play_hq_audio())
+        end)
+        if not success then
+            error(err or "Failed to request HLS stream")
+        end
     else
-        youcubeapi:request_media(url, nil, nil, can_play_hq_audio())
+        if not args.no_video then
+            local width, height = get_video_size()
+            youcubeapi:request_media(url, width, height, can_play_hq_audio())
+        else
+            youcubeapi:request_media(url, nil, nil, can_play_hq_audio())
+        end
+
+        local x, y = term.getCursorPos()
+        repeat
+            data = youcubeapi:receive()
+            if data.action == "status" then
+                os.queueEvent("youcube:status", data)
+                term.setCursorPos(x, y)
+                term.clearLine()
+                term.write("Status: ")
+                write_colored(data.message, colors.green)
+                term.setTextColor(colors.white)
+            else
+                new_line()
+            end
+        until data.action == "media"
     end
 
-    local data
-    local x, y = term.getCursorPos()
-
-    repeat
-        data = youcubeapi:receive()
-        if data.action == "status" then
-            os.queueEvent("youcube:status", data)
-            term.setCursorPos(x, y)
-            term.clearLine()
-            term.write("Status: ")
-            write_colored(data.message, colors.green)
-            term.setTextColor(colors.white)
-        else
-            new_line()
-        end
-    until data.action == "media"
-
-    if data.action == "error" then
-        error(data.message)
+    if not data or data.action == "error" then
+        error(data and data.message or "An error occurred during HLS request")
     end
 
     term.write("Playing: ")
@@ -540,11 +569,6 @@ local function play(url)
         sleep(2)
     end
 
-    local video_buffer = libs.youcubeapi.Buffer.new(
-        libs.youcubeapi.VideoFiller.new(youcubeapi, data.id, get_video_size()),
-        60 -- Most videos run on 30 fps, so we store 2s of video.
-    )
-
     local left_speaker_attached = false
     local right_speaker_attached = false
     for i = 1, #audiodevices do
@@ -558,26 +582,48 @@ local function play(url)
 
     local use_stereo = left_speaker_attached and right_speaker_attached and not args.no_audio
 
-    local audio_buffer, audio_buffer_left, audio_buffer_right
-    if use_stereo then
-        audio_buffer_left = libs.youcubeapi.Buffer.new(
-            libs.youcubeapi.AudioFiller.new(youcubeapi, data.id .. "_left"),
-            32
+    local video_buffer, audio_buffer, audio_buffer_left, audio_buffer_right
+    if args.hls then
+        local w, h = get_video_size()
+        video_buffer = libs.youcubeapi.Buffer.new(
+            libs.youcubeapi.HLSVideoFiller.new(youcubeapi, data.id, w, h, data.video_segments_count),
+            60
         )
-        audio_buffer_right = libs.youcubeapi.Buffer.new(
-            libs.youcubeapi.AudioFiller.new(youcubeapi, data.id .. "_right"),
-            32
-        )
+        if use_stereo then
+            audio_buffer_left = libs.youcubeapi.Buffer.new(
+                libs.youcubeapi.HLSAudioFiller.new(youcubeapi, data.id .. "_left", data.audio_segments_count),
+                32
+            )
+            audio_buffer_right = libs.youcubeapi.Buffer.new(
+                libs.youcubeapi.HLSAudioFiller.new(youcubeapi, data.id .. "_right", data.audio_segments_count),
+                32
+            )
+        else
+            audio_buffer = libs.youcubeapi.Buffer.new(
+                libs.youcubeapi.HLSAudioFiller.new(youcubeapi, data.id, data.audio_segments_count),
+                32
+            )
+        end
     else
-        audio_buffer = libs.youcubeapi.Buffer.new(
-            libs.youcubeapi.AudioFiller.new(youcubeapi, data.id),
-            --[[
-                We want to buffer 1024 chunks.
-                One chunks is 16 bits.
-                The server (with default settings) sends 32 chunks at once.
-            ]]
-            32
+        video_buffer = libs.youcubeapi.Buffer.new(
+            libs.youcubeapi.VideoFiller.new(youcubeapi, data.id, get_video_size()),
+            60
         )
+        if use_stereo then
+            audio_buffer_left = libs.youcubeapi.Buffer.new(
+                libs.youcubeapi.AudioFiller.new(youcubeapi, data.id .. "_left"),
+                32
+            )
+            audio_buffer_right = libs.youcubeapi.Buffer.new(
+                libs.youcubeapi.AudioFiller.new(youcubeapi, data.id .. "_right"),
+                32
+            )
+        else
+            audio_buffer = libs.youcubeapi.Buffer.new(
+                libs.youcubeapi.AudioFiller.new(youcubeapi, data.id),
+                32
+            )
+        end
     end
 
     if args.verbose then
@@ -586,22 +632,19 @@ local function play(url)
         term.write("[DEBUG MODE]")
     end
 
-    local function fill_buffers()
+    local function fill_audio_buffers()
         while true do
-            os.queueEvent("youcube:fill_buffers")
-
-            local event = os.pullEventRaw()
-
-            if event == "terminate" then
-                reset_video_display()
-            end
-
+            local filled = false
             if not args.no_audio then
                 if use_stereo then
-                    audio_buffer_left:fill()
-                    audio_buffer_right:fill()
+                    local filled_l, filled_r
+                    parallel.waitForAll(
+                        function() filled_l = audio_buffer_left:fill() end,
+                        function() filled_r = audio_buffer_right:fill() end
+                    )
+                    filled = filled_l or filled_r
                 else
-                    audio_buffer:fill()
+                    filled = audio_buffer:fill()
                 end
             end
 
@@ -615,8 +658,20 @@ local function play(url)
                 end
             end
 
+            if not filled then
+                sleep(0.05)
+            end
+        end
+    end
+
+    local function fill_video_buffer()
+        while true do
+            local filled = false
             if not args.no_video then
-                video_buffer:fill()
+                filled = video_buffer:fill()
+            end
+            if not filled then
+                sleep(0.05)
             end
         end
     end
@@ -650,9 +705,25 @@ local function play(url)
         end
     end
 
+    local function _terminate_handler()
+        while true do
+            local event = os.pullEventRaw()
+            if event == "terminate" then
+                reset_video_display()
+                error("Terminated")
+            end
+        end
+    end
+
     local function _play_media()
         os.queueEvent("youcube:playing")
-        parallel.waitForAll(_play_video, _play_audio)
+        parallel.waitForAll(
+            _play_video,
+            _play_audio,
+            fill_audio_buffers,
+            fill_video_buffer,
+            _terminate_handler
+        )
     end
 
     local function _hotkey_handler()
@@ -681,7 +752,7 @@ local function play(url)
         end
     end
 
-    parallel.waitForAny(fill_buffers, _play_media, _hotkey_handler)
+    parallel.waitForAny(_play_media, _hotkey_handler)
 
     if data.playlist_videos then
         return data.playlist_videos
