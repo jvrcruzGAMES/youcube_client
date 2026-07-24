@@ -568,29 +568,42 @@ end
 
 local HLSAudioFiller = {}
 
-function HLSAudioFiller.new(youcubeapi, id, max_segments)
+function HLSAudioFiller.new(youcubeapi, id)
     local self = {
         id = id,
-        segment_index = 0,
         youcubeapi = youcubeapi,
-        max_segments = max_segments,
+        response = nil,
+        buffer = "",
+        eof = false,
     }
 
     function self:next()
-        if self.max_segments and self.segment_index >= self.max_segments then
-            return ""
+        if not self.response then
+            local url = self.youcubeapi.http_base_url .. "/dfpwm/" .. self.id
+            local resp, err = http.get(url, nil, true)
+            if not resp then
+                error("Failed to connect to audio stream: " .. (err or "unknown error"))
+            end
+            self.response = resp
         end
-        local response = self.youcubeapi:hls_get_audio_chunk(self.id, self.segment_index)
-        self.segment_index = self.segment_index + 1
-        if not response or response == "" then
-            return ""
+
+        while not self.eof and #self.buffer < 1024 do
+            local chunk = self.response.read(65536)
+            if not chunk then
+                self.eof = true
+                self.response.close()
+                break
+            end
+            self.buffer = self.buffer .. chunk
         end
-        -- Split response into chunks of 1024 bytes
-        local chunks = {}
-        for i = 1, #response, 1024 do
-            chunks[#chunks + 1] = response:sub(i, i + 1023)
+
+        if #self.buffer > 0 then
+            local chunk = self.buffer:sub(1, 1024)
+            self.buffer = self.buffer:sub(1025)
+            return chunk
         end
-        return chunks
+
+        return ""
     end
 
     return self
@@ -598,31 +611,64 @@ end
 
 local HLSVideoFiller = {}
 
-function HLSVideoFiller.new(youcubeapi, id, width, height, max_segments)
+function HLSVideoFiller.new(youcubeapi, id, width, height)
     local self = {
         id = id,
         width = width,
         height = height,
-        segment_index = 0,
         youcubeapi = youcubeapi,
-        max_segments = max_segments,
+        response = nil,
+        buffer = "",
+        eof = false,
     }
 
     function self:next()
-        if self.max_segments and self.segment_index >= self.max_segments then
-            return {}
+        if not self.response then
+            local url = self.youcubeapi.http_base_url .. "/32vid/" .. self.id .. "/" .. (self.width * 2) .. "/" .. (self.height * 3)
+            local resp, err = http.get(url, nil, true)
+            if not resp then
+                error("Failed to connect to video stream: " .. (err or "unknown error"))
+            end
+            self.response = resp
         end
-        local body = self.youcubeapi:hls_get_video_frame(self.id, self.width, self.height, self.segment_index)
-        self.segment_index = self.segment_index + 1
-        if not body or body == "" then
-            return {}
+
+        while not self.eof do
+            local newline_pos = self.buffer:find("\n")
+            if newline_pos then
+                local line = self.buffer:sub(1, newline_pos - 1)
+                self.buffer = self.buffer:sub(newline_pos + 1)
+                if line:sub(-1) == "\r" then
+                    line = line:sub(1, -2)
+                end
+                return { line }
+            end
+
+            local chunk = self.response.read(65536)
+            if not chunk then
+                self.eof = true
+                self.response.close()
+                break
+            end
+            self.buffer = self.buffer .. chunk
         end
-        -- Split by newlines
-        local lines = {}
-        for line in body:gmatch("[^\r\n]+") do
-            lines[#lines + 1] = line
+
+        if self.buffer ~= "" then
+            local newline_pos = self.buffer:find("\n")
+            local line
+            if newline_pos then
+                line = self.buffer:sub(1, newline_pos - 1)
+                self.buffer = self.buffer:sub(newline_pos + 1)
+            else
+                line = self.buffer
+                self.buffer = ""
+            end
+            if line:sub(-1) == "\r" then
+                line = line:sub(1, -2)
+            end
+            return { line }
         end
-        return lines
+
+        return {}
     end
 
     return self

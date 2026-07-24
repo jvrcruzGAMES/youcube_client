@@ -588,21 +588,21 @@ local function play(url)
     if args.hls then
         local w, h = get_video_size()
         video_buffer = libs.youcubeapi.Buffer.new(
-            libs.youcubeapi.HLSVideoFiller.new(youcubeapi, data.id, w, h, data.video_segments_count),
+            libs.youcubeapi.HLSVideoFiller.new(youcubeapi, data.id, w, h),
             60
         )
         if use_stereo then
             audio_buffer_left = libs.youcubeapi.Buffer.new(
-                libs.youcubeapi.HLSAudioFiller.new(youcubeapi, data.id .. "_left", data.audio_segments_count),
+                libs.youcubeapi.HLSAudioFiller.new(youcubeapi, data.id .. "_left"),
                 32
             )
             audio_buffer_right = libs.youcubeapi.Buffer.new(
-                libs.youcubeapi.HLSAudioFiller.new(youcubeapi, data.id .. "_right", data.audio_segments_count),
+                libs.youcubeapi.HLSAudioFiller.new(youcubeapi, data.id .. "_right"),
                 32
             )
         else
             audio_buffer = libs.youcubeapi.Buffer.new(
-                libs.youcubeapi.HLSAudioFiller.new(youcubeapi, data.id, data.audio_segments_count),
+                libs.youcubeapi.HLSAudioFiller.new(youcubeapi, data.id),
                 32
             )
         end
