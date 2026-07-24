@@ -571,18 +571,26 @@ local HLSAudioFiller = {}
 function HLSAudioFiller.new(youcubeapi, id, max_segments)
     local self = {
         id = id,
-        chunkindex = 0,
+        segment_index = 0,
         youcubeapi = youcubeapi,
         max_segments = max_segments,
     }
 
     function self:next()
-        if self.max_segments and self.chunkindex >= self.max_segments then
+        if self.max_segments and self.segment_index >= self.max_segments then
             return ""
         end
-        local response = self.youcubeapi:hls_get_audio_chunk(self.id, self.chunkindex)
-        self.chunkindex = self.chunkindex + 1
-        return response
+        local response = self.youcubeapi:hls_get_audio_chunk(self.id, self.segment_index)
+        self.segment_index = self.segment_index + 1
+        if not response or response == "" then
+            return ""
+        end
+        -- Split response into chunks of 1024 bytes
+        local chunks = {}
+        for i = 1, #response, 1024 do
+            chunks[#chunks + 1] = response:sub(i, i + 1023)
+        end
+        return chunks
     end
 
     return self
@@ -595,21 +603,26 @@ function HLSVideoFiller.new(youcubeapi, id, width, height, max_segments)
         id = id,
         width = width,
         height = height,
-        chunkindex = 0,
+        segment_index = 0,
         youcubeapi = youcubeapi,
         max_segments = max_segments,
     }
 
     function self:next()
-        if self.max_segments and self.chunkindex >= self.max_segments then
+        if self.max_segments and self.segment_index >= self.max_segments then
             return {}
         end
-        local line = self.youcubeapi:hls_get_video_frame(self.id, self.width, self.height, self.chunkindex)
-        self.chunkindex = self.chunkindex + 1
-        if not line or line == "" then
+        local body = self.youcubeapi:hls_get_video_frame(self.id, self.width, self.height, self.segment_index)
+        self.segment_index = self.segment_index + 1
+        if not body or body == "" then
             return {}
         end
-        return { line }
+        -- Split by newlines
+        local lines = {}
+        for line in body:gmatch("[^\r\n]+") do
+            lines[#lines + 1] = line
+        end
+        return lines
     end
 
     return self
