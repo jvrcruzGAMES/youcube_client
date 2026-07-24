@@ -215,6 +215,22 @@ end
 local youcubeapi = libs.youcubeapi.API.new()
 local audiodevices = get_audiodevices()
 
+local function get_video_display()
+    if peripheral and peripheral.getType and peripheral.getType("back") == "monitor" then
+        local display = peripheral.wrap("back")
+        if display then
+            return display
+        end
+    end
+    return term
+end
+
+local video_display = get_video_display()
+
+local function reset_video_display()
+    libs.youcubeapi.reset_term(video_display)
+end
+
 -- update check --
 
 local function get_versions()
@@ -398,7 +414,7 @@ local function play(url)
     print("Requesting media ...")
 
     if not args.no_video then
-        local width, height = term.getSize()
+        local width, height = video_display.getSize()
         youcubeapi:request_media(url, width, height, can_play_hq_audio())
     else
         youcubeapi:request_media(url, nil, nil, can_play_hq_audio())
@@ -444,7 +460,7 @@ local function play(url)
     end
 
     local video_buffer = libs.youcubeapi.Buffer.new(
-        libs.youcubeapi.VideoFiller.new(youcubeapi, data.id, term.getSize()),
+        libs.youcubeapi.VideoFiller.new(youcubeapi, data.id, video_display.getSize()),
         60 -- Most videos run on 30 fps, so we store 2s of video.
     )
 
@@ -471,7 +487,7 @@ local function play(url)
             local event = os.pullEventRaw()
 
             if event == "terminate" then
-                libs.youcubeapi.reset_term()
+                reset_video_display()
             end
 
             if not args.no_audio then
@@ -498,7 +514,7 @@ local function play(url)
             end
 
             os.queueEvent("youcube:vid_playing", data)
-            libs.youcubeapi.play_vid(video_buffer, args.force_fps, string_unpack)
+            libs.youcubeapi.play_vid(video_buffer, args.force_fps, string_unpack, video_display)
             os.queueEvent("youcube:vid_eof", data)
         end
     end
@@ -530,7 +546,7 @@ local function play(url)
                     back_buffer[1] = nil --remove it from the front of the buffer
                 end
                 if not args.no_video then
-                    libs.youcubeapi.reset_term()
+                    reset_video_display()
                 end
                 break
             end
@@ -538,7 +554,7 @@ local function play(url)
             if key == restart_key then
                 queue[#queue + 1] = url --add the current song to upcoming
                 if not args.no_video then
-                    libs.youcubeapi.reset_term()
+                    reset_video_display()
                 end
                 restart = true
                 break
@@ -580,7 +596,7 @@ local function play_playlist(playlist)
                         queue[#queue + 1] = prev --add previous song to upcoming
                     end
                     if not args.no_video then
-                        libs.youcubeapi.reset_term()
+                        reset_video_display()
                     end
                     break
                 end
@@ -629,7 +645,7 @@ local function main()
     youcubeapi.websocket.close()
 
     if not args.no_video then
-        libs.youcubeapi.reset_term()
+        reset_video_display()
     end
 
     os.queueEvent("youcube:playback_ended")

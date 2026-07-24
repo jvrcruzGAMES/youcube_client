@@ -33,9 +33,6 @@ end
 -- Contact the server owner on Discord, when the server is down
 local servers = {
     "ws://127.0.0.1:5000", -- Your server!
-    "wss://us-ky.youcube.knijn.one", -- By EmmaKnijn
-    "wss://youcube.knijn.one", -- By EmmaKnijn
-    "wss://youcube.onrender.com", -- By Commandcracker#8528
 }
 
 if settings then
@@ -532,21 +529,28 @@ function Buffer.new(filler, size)
     return self
 end
 
-local currnt_palette = {}
-
-for i = 0, 15 do
-    local r, g, b = term.getPaletteColour(2 ^ i)
-    currnt_palette[i] = { r, g, b }
+local function get_palette(display)
+    local palette = {}
+    for i = 0, 15 do
+        local r, g, b = display.getPaletteColour(2 ^ i)
+        palette[i] = { r, g, b }
+    end
+    return palette
 end
 
-local function reset_term()
+local currnt_palette = get_palette(term)
+
+local function reset_term(display, palette)
+    display = display or term
+    palette = palette or currnt_palette
+
     for i = 0, 15 do
-        term.setPaletteColor(2 ^ i, currnt_palette[i][1], currnt_palette[i][2], currnt_palette[i][3])
+        display.setPaletteColor(2 ^ i, palette[i][1], palette[i][2], palette[i][3])
     end
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
-    term.clear()
-    term.setCursorPos(1, 1)
+    display.setBackgroundColor(colors.black)
+    display.setTextColor(colors.white)
+    display.clear()
+    display.setCursorPos(1, 1)
 end
 
 --[[- Create's a new Buffer instance.
@@ -555,11 +559,12 @@ end
     and [sanjuuni/websocket-player.lua](https://github.com/MCJack123/sanjuuni/blob/30dcabb4b56f1eb32c88e1bce384b0898367ebda/websocket-player.lua)
     @tparam Buffer buffer filled with frames
 ]]
-local function play_vid(buffer, force_fps, string_unpack)
+local function play_vid(buffer, force_fps, string_unpack, display)
     if not string_unpack then
         string_unpack = string.unpack
     end
-    local Fwidth, Fheight = term.getSize()
+    display = display or term
+    local palette = get_palette(display)
     local tracker = 0
 
     if buffer:next() ~= "32Vid 1.1" then
@@ -579,7 +584,7 @@ local function play_vid(buffer, force_fps, string_unpack)
     if second == "" or second == nil then
         fps = 0
     end
-    term.clear()
+    display.clear()
 
     local start = os.epoch("utc")
     local frame_count = 0
@@ -634,14 +639,14 @@ local function play_vid(buffer, force_fps, string_unpack)
                     c, n, pos = string_unpack("BB", data, pos)
                 end
             end
-            term.setCursorPos(1, y)
-            term.blit(text[y], fg, bg)
+            display.setCursorPos(1, y)
+            display.blit(text[y], fg, bg)
         end
         pos = pos - 2
         local r, g, b
         for i = 0, 15 do
             r, g, b, pos = string_unpack("BBB", data, pos)
-            term.setPaletteColor(2 ^ i, r / 255, g / 255, b / 255)
+            display.setPaletteColor(2 ^ i, r / 255, g / 255, b / 255)
         end
         if fps == 0 then
             read()
@@ -652,7 +657,7 @@ local function play_vid(buffer, force_fps, string_unpack)
             end
         end
     end
-    reset_term()
+    reset_term(display, palette)
 end
 
 return {
