@@ -33,6 +33,7 @@ end
 -- Contact the server owner on Discord, when the server is down
 local servers = {
     "ws://127.0.0.1:5000", -- Your server!
+    "wss://youcube.jvrcruz.games"
 }
 
 if settings then
