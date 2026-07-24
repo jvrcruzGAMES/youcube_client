@@ -225,7 +225,7 @@ end
 --- Request media
 -- @tparam string url Url or Search Term
 --@treturn table json response
-function API:request_media(url, width, height)
+function API:request_media(url, width, height, hq_audio)
     local request = {
         ["action"] = "request_media",
         ["url"] = url,
@@ -233,6 +233,9 @@ function API:request_media(url, width, height)
     if width and height then
         request.width = width * 2
         request.height = height * 3
+    end
+    if hq_audio then
+        request.hq_audio = true
     end
     self:send(request)
     --return self:receive({ ["media"] = true, ["status"] = true })
@@ -311,6 +314,46 @@ function Speaker.new(speaker)
         local buffer = decoder(chunk)
         while not self.speaker.playAudio(buffer, self.volume) do
             os.pullEvent("speaker_audio_empty")
+        end
+    end
+
+    return self
+end
+
+--[[- @{AudioDevice} from CC:HQ Speakers
+    @type HQSpeaker
+]]
+local HQSpeaker = {}
+
+--- Create's a new high-quality speaker instance.
+-- @tparam speaker speaker The speaker
+-- @treturn AudioDevice|HQSpeaker instance
+function HQSpeaker.new(speaker)
+    local self = AudioDevice.new({ speaker = speaker })
+
+    function self:validate()
+        if not self.speaker.speakStream then
+            return "CC:HQ Speakers speakStream support not found"
+        end
+    end
+
+    function self:setVolume(volume)
+        self.volume = volume
+        if volume and self.speaker.speakVolume then
+            self.speaker.speakVolume(volume)
+        end
+    end
+
+    function self:playUrl(url)
+        self.speaker.speakStream(url, self.volume)
+        while self.speaker.speakIsPlaying and self.speaker.speakIsPlaying() do
+            sleep(0.25)
+        end
+    end
+
+    function self:reset()
+        if self.speaker.speakStop then
+            self.speaker.speakStop()
         end
     end
 
@@ -626,6 +669,7 @@ return {
     API = API,
     AudioDevice = AudioDevice,
     Speaker = Speaker,
+    HQSpeaker = HQSpeaker,
     Tape = Tape,
     Base64 = Base64,
     Filler = Filler,

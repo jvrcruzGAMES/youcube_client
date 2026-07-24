@@ -171,7 +171,11 @@ local function get_audiodevices()
 
     local speakers = { peripheral.find("speaker") }
     for i = 1, #speakers do
-        audiodevices[#audiodevices + 1] = libs.youcubeapi.Speaker.new(speakers[i])
+        if speakers[i].speakStream then
+            audiodevices[#audiodevices + 1] = libs.youcubeapi.HQSpeaker.new(speakers[i])
+        else
+            audiodevices[#audiodevices + 1] = libs.youcubeapi.Speaker.new(speakers[i])
+        end
     end
 
     local tapes = { peripheral.find("tape_drive") }
@@ -352,6 +356,31 @@ local function play_audio(buffer, title)
     end
 end
 
+local function can_play_hq_audio()
+    for i = 1, #audiodevices do
+        if audiodevices[i].playUrl then
+            return true
+        end
+    end
+    return false
+end
+
+local function play_hq_audio(url, title)
+    local play_functions = {}
+    for i = 1, #audiodevices do
+        local audiodevice = audiodevices[i]
+        if audiodevice.playUrl then
+            audiodevice:reset()
+            audiodevice:setLabel(title)
+            audiodevice:setVolume(args.volume)
+            play_functions[#play_functions + 1] = function()
+                audiodevice:playUrl(url)
+            end
+        end
+    end
+    parallel.waitForAll(table.unpack(play_functions))
+end
+
 -- #region playback controll vars
 local back_buffer = {}
 local max_back = settings.get("youcube.max_back") or 32
@@ -369,9 +398,10 @@ local function play(url)
     print("Requesting media ...")
 
     if not args.no_video then
-        youcubeapi:request_media(url, term.getSize())
+        local width, height = term.getSize()
+        youcubeapi:request_media(url, width, height, can_play_hq_audio())
     else
-        youcubeapi:request_media(url)
+        youcubeapi:request_media(url, nil, nil, can_play_hq_audio())
     end
 
     local data
@@ -476,7 +506,11 @@ local function play(url)
     local function _play_audio()
         if not args.no_audio then
             os.queueEvent("youcube:audio_playing", data)
-            play_audio(audio_buffer, data.title)
+            if data.audio_url and can_play_hq_audio() then
+                play_hq_audio(data.audio_url, data.title)
+            else
+                play_audio(audio_buffer, data.title)
+            end
             os.queueEvent("youcube:audio_eof", data)
         end
     end
